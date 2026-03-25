@@ -1,0 +1,23 @@
+version: '3'
+services:
+  omchat-dev:
+    image: registry.linker.cc/linker/bg:v1.0.0
+    # command: sleep infinity
+    volumes:
+      - ./resources:/app/resources
+      #  - ./:/app/
+    ports:
+      - "6574:8000"
+    container_name: rmbg
+    environment:
+      - DEVICE_TYPE=A10
+    restart: always
+    shm_size: 240g
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+

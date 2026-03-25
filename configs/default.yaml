@@ -1,0 +1,6 @@
+IS_DEBUG: false
+IS_ENCRYPT: true
+MODEL_DIR: "resources"
+DEVICE: "cuda:0"
+TIME_OUT: 30
+RAPIDOCR_CONFIG: "configs/rapidocr_config.yaml"

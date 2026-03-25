@@ -1,0 +1,15 @@
+opencv-contrib-python==4.8.0.74
+opencv-python==4.6.0.66
+numpy==1.24.4
+# paddlepaddle-gpu==2.6.2
+pyclipper
+shapely
+onnxruntime-gpu==1.18.0
+rapidocr_onnxruntime
+pydantic==2.8.2
+uvicorn
+fastapi
+apscheduler
+apache-skywalking
+pyinstrument
+rapidocr
