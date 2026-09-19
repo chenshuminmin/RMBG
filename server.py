@@ -1,13 +1,75 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from PIL import Image
 import torch
 from torchvision import transforms
 import os
+import shutil
 import numpy as np
 import time
 import uuid
+from io import BytesIO
 from pathlib import Path
+from typing import Optional
+
+
+# 结果是否落盘。默认关闭：容器内每请求生成一个 PNG 且从不清理，会把容器
+# 可写层写满（表现为 "[Errno 28] No space left on device"，所有请求 500）。
+# 现在默认在内存中直接返回，磁盘不再是处理链路的一部分。
+SAVE_TEMP_RESULTS = os.getenv("SAVE_TEMP_RESULTS", "0").strip().lower() in {"1", "true", "yes"}
+# 落盘模式下：可用空间低于该值时先清理再放弃落盘（不失败）。
+MIN_FREE_BYTES_BEFORE_SAVE = 512 * 1024 * 1024
+# 启动时自动清理超过该小时数的历史结果。
+STARTUP_PURGE_MAX_AGE_HOURS = float(os.getenv("TEMP_RESULT_MAX_AGE_HOURS", "24"))
+
+
+def _disk_free_bytes(path: Path) -> int:
+    try:
+        return shutil.disk_usage(str(path)).free
+    except OSError:
+        return -1
+
+
+def _purge_old_results(temp_dir: Path, max_age_hours: float = 1.0, keep_recent: int = 0) -> tuple[int, int]:
+    """删除过期的历史结果文件，返回 (删除数量, 释放字节数)。"""
+    removed = 0
+    freed = 0
+    try:
+        entries = [p for p in temp_dir.glob("white_bg_*") if p.is_file()]
+    except OSError:
+        return 0, 0
+    if keep_recent:
+        entries.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        entries = entries[keep_recent:]
+    cutoff = time.time() - max(0.0, max_age_hours) * 3600
+    for path in entries:
+        try:
+            if max_age_hours > 0 and path.stat().st_mtime > cutoff:
+                continue
+            size = path.stat().st_size
+            path.unlink()
+            removed += 1
+            freed += size
+        except OSError:
+            continue
+    return removed, freed
+
+
+def _safe_save_result(payload: bytes, temp_dir: Path) -> Optional[Path]:
+    """尽量把结果落到磁盘，任何空间问题都只告警、绝不让请求失败。"""
+    if _disk_free_bytes(temp_dir) < MIN_FREE_BYTES_BEFORE_SAVE:
+        removed, freed = _purge_old_results(temp_dir, max_age_hours=1.0)
+        print(f"🧹 磁盘空间不足，已清理历史结果 {removed} 个（释放 {freed / 1024 / 1024:.1f} MB）")
+        if _disk_free_bytes(temp_dir) < MIN_FREE_BYTES_BEFORE_SAVE:
+            print("⚠️ 磁盘空间仍不足，本次结果不落盘（不影响返回）")
+            return None
+    try:
+        path = temp_dir / f"white_bg_{uuid.uuid4()}.png"
+        path.write_bytes(payload)
+        return path
+    except OSError as exc:
+        print(f"⚠️ 结果落盘失败（不影响返回）：{exc}")
+        return None
 
 
 # 初始化FastAPI应用（仅单图处理相关配置）
@@ -28,7 +90,11 @@ class BiRefNetWhiteBgExtractor:
         # 3. 创建临时结果目录（存储处理后的白底图，避免内存堆积）
         self.temp_dir = Path("./temp_white_bg_results")
         self.temp_dir.mkdir(exist_ok=True, parents=True)
-        print(f"✅ BiRefNet初始化完成\n📌 运行设备：{self.device}\n📂 临时结果目录：{self.temp_dir}")
+        removed, freed = _purge_old_results(self.temp_dir, max_age_hours=STARTUP_PURGE_MAX_AGE_HOURS)
+        if removed:
+            print(f"🧹 启动时清理历史结果 {removed} 个（释放 {freed / 1024 / 1024:.1f} MB）")
+        print(f"✅ BiRefNet初始化完成\n📌 运行设备：{self.device}\n📂 临时结果目录：{self.temp_dir}"
+              f"\n💾 结果落盘：{'开启' if SAVE_TEMP_RESULTS else '关闭（内存直接返回）'}")
 
     def _setup_device(self, device):
         """简化设备选择：仅支持auto/cpu/cuda"""
@@ -134,19 +200,26 @@ async def process_single_image(file: UploadFile = File(..., description="待处�
             # 4. 处理图像（调用提取器核心方法）
             result_img, cost_time = extractor.process_single_image(img)
 
-        # 5. 生成临时文件名（UUID确保唯一性，避免覆盖）
-        temp_filename = f"white_bg_{uuid.uuid4()}.png"
-        temp_save_path = extractor.temp_dir / temp_filename
+        # 5. 结果编码到内存（PNG格式，避免JPG压缩失真）
+        #    默认不落盘：容器可写层曾因历史结果堆积被写满，导致所有请求
+        #    "[Errno 28] No space left on device"。内存返回让磁盘不再是瓶颈。
+        with BytesIO() as buffer:
+            result_img.save(buffer, format="PNG")
+            payload = buffer.getvalue()
 
-        # 6. 保存结果（PNG格式，避免JPG压缩失真）
-        result_img.save(temp_save_path, format="PNG")
-        print(f"📊 图像处理完成\n📄 原始文件：{file.filename}\n⏱️  耗时：{cost_time:.2f}s\n💾 临时保存路径：{temp_save_path}")
+        if SAVE_TEMP_RESULTS:
+            temp_save_path = _safe_save_result(payload, extractor.temp_dir)
+            if temp_save_path is not None:
+                print(f"💾 临时保存路径：{temp_save_path}")
 
-        # 7. 返回白底图（指定下载文件名，方便前端处理）
-        return FileResponse(
-            path=temp_save_path,
-            filename=f"white_bg_{os.path.splitext(file.filename)[0]}.png",  # 下载文件名：white_bg_原始名.png
-            media_type="image/png"
+        # 6. 返回白底图（指定下载文件名，方便前端处理）
+        download_name = f"white_bg_{os.path.splitext(file.filename or 'image')[0]}.png"
+        print(f"📊 图像处理完成\n📄 原始文件：{file.filename}\n⏱️  耗时：{cost_time:.2f}s\n📦 结果大小：{len(payload) / 1024:.1f} KB")
+
+        return Response(
+            content=payload,
+            media_type="image/png",
+            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
         )
 
     except Exception as e:
@@ -170,16 +243,43 @@ async def process_single_image(file: UploadFile = File(..., description="待处�
 )
 async def health_check():
     if extractor is not None:
+        free = _disk_free_bytes(extractor.temp_dir)
         return {
             "status": "healthy",
             "message": "服务正常运行，可接收单图处理请求",
             "device": extractor.device,
-            "temp_dir": str(extractor.temp_dir)
+            "temp_dir": str(extractor.temp_dir),
+            "save_temp_results": SAVE_TEMP_RESULTS,
+            "free_bytes": free,
+            "free_gb": round(free / 1024 ** 3, 2),
+            "low_disk": 0 <= free < MIN_FREE_BYTES_BEFORE_SAVE,
         }
     return {
         "status": "unhealthy",
         "message": "服务未初始化成功，请检查模型或重启服务",
         "device": "unknown"
+    }
+
+
+# --------------------------
+# 运维接口：清理历史临时结果
+# --------------------------
+@app.post(
+    path="/cleanup",
+    summary="清理历史白底结果文件",
+    description="删除 temp_white_bg_results 下的历史结果，释放磁盘空间（磁盘写满时用于救急）"
+)
+async def cleanup_results(max_age_hours: float = 0.0):
+    if extractor is None:
+        raise HTTPException(status_code=500, detail="服务未初始化成功，无法清理")
+    removed, freed = _purge_old_results(extractor.temp_dir, max_age_hours=max_age_hours)
+    free = _disk_free_bytes(extractor.temp_dir)
+    return {
+        "removed": removed,
+        "freed_bytes": freed,
+        "freed_mb": round(freed / 1024 / 1024, 2),
+        "free_bytes": free,
+        "free_gb": round(free / 1024 ** 3, 2),
     }
 
 
