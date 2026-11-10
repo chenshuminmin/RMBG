@@ -1,0 +1,8 @@
+.venv/
+resources/
+_dl/*.whl
+_dl/*.zip
+_dl/*.part*
+__pycache__/
+*.pyc
+logs/*.log

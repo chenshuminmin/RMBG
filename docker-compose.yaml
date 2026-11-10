@@ -1,18 +1,27 @@
-version: '3'
 services:
-  omchat-dev:
-    image: registry.linker.cc/linker/bg:v1.0.0
-    # command: sleep infinity
+  rmbg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rmbg-whitebg:v1.0.0
+    container_name: rmbg
     volumes:
-      - ./resources:/app/resources
-      #  - ./:/app/
+      # 模型权重放宿主机 ./resources，容器只读挂载，重建镜像不用重新下模型
+      - ./resources:/app/resources:ro
     ports:
       - "6574:8000"
-    container_name: rmbg
     environment:
-      - DEVICE_TYPE=A10
+      - MODEL_PATH=/app/resources/BiRefNet-HRSOD
+      - PORT=8000
+      - DEVICE=auto
     restart: always
-    shm_size: 240g
+    shm_size: 8g
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     deploy:
       resources:
         reservations:
@@ -20,4 +29,3 @@ services:
             - driver: nvidia
               device_ids: ["0"]
               capabilities: [gpu]
-
